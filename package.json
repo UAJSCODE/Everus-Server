@@ -1,0 +1,26 @@
+{
+  "name": "everus-signaling-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --experimental-strip-types --watch src/server.ts",
+    "start": "node --env-file-if-exists=.env --experimental-strip-types src/server.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.14",
+    "@fastify/websocket": "^11.2.0",
+    "fastify": "^5.6.1",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "@types/pg": "^8.15.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.9.3",
+    "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
