@@ -388,6 +388,263 @@ export async function createApp({ db, pairingTtlSeconds = Number(process.env.PAI
     }
   });
 
+  // MEDIA TRANSFER ENDPOINTS
+  app.post("/media/init", async (request: ApiRequest, reply) => {
+    try {
+      const body = request.body;
+      const fromDeviceId = requiredUuid(body.senderDeviceId, "senderDeviceId");
+      const toDeviceId = requiredUuid(body.receiverDeviceId, "receiverDeviceId");
+      const filename = requiredString(body.filename, "filename", 255);
+      const mimeType = requiredString(body.mimeType, "mimeType", 100);
+      const fileSize = Number(body.fileSize);
+      const transferId = randomUUID();
+
+      // Validate sender and receiver are paired
+      const relationship = await db.query(
+        `SELECT status FROM relationships WHERE
+         (device_a = LEAST($1::uuid, $2::uuid) AND device_b = GREATEST($1::uuid, $2::uuid))`,
+        [fromDeviceId, toDeviceId]
+      );
+      if (!relationship.rows[0] || relationship.rows[0].status !== 'COMPLETED') {
+        return reply.code(403).send({ error: "No completed relationship exists between devices" });
+      }
+
+      // Validate file size limits
+      if (fileSize <= 0) {
+        return reply.code(400).send({ error: "File size must be positive" });
+      }
+      if (fileSize > 100 * 1024 * 1024) { // 100MB limit
+        return reply.code(400).send({ error: "File size exceeds maximum allowed size (100MB)" });
+      }
+
+      // Validate MIME type
+      const allowedMimeTypes = [
+        'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+        'video/mp4', 'video/quicktime', 'video/x-msvideo',
+        'application/pdf', 'text/plain', 'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      ];
+      if (!allowedMimeTypes.includes(mimeType)) {
+        return reply.code(400).send({ error: "Unsupported file type" });
+      }
+
+      // Generate object key for storage
+      const objectKey = `${transferId}/${filename}`;
+
+      // Determine bucket based on MIME type
+      let bucket = 'everus-documents'; // default
+      if (mimeType.startsWith('image/')) {
+        bucket = 'everus-images';
+      } else if (mimeType.startsWith('video/')) {
+        bucket = 'everus-videos';
+      }
+
+      // Create media transfer record
+      await db.query(
+        `INSERT INTO media_transfers(
+          transfer_id, message_id, sender_device_id, receiver_device_id,
+          filename, mime_type, file_size, object_key, bucket, status, upload_progress, expires_at
+        ) VALUES (
+          $1, NULL, $2, $3, $4, $5, $6, $7, $8, 'PENDING', 0,
+          NOW() + INTERVAL '1 hour'
+        )`,
+        [transferId, fromDeviceId, toDeviceId, filename, mimeType, fileSize, objectKey, bucket]
+      );
+
+      // In a real implementation with Supabase Storage, we would generate an upload URL here
+      // For now, we'll return the transfer ID and let the client know they can upload via our chunked endpoint
+      const uploadUrl = `/media/${transferId}/upload`;
+
+      app.log.info({ event: "MEDIA_TRANSFER_INITIATED", transferId, fromDeviceId, toDeviceId, filename });
+      return reply.code(201).send({
+        transferId,
+        uploadUrl,
+        expiresAt: new Date(Date.now() + 3600 * 1000), // 1 hour from now
+        maxChunkSize: 1024 * 1024 // 1MB chunks
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid media transfer request" });
+    }
+  });
+
+  app.post("/media/:transferId/upload", async (request: ApiRequest, reply) => {
+    try {
+      const transferId = requiredUuid(request.params.transferId, "transferId");
+      const deviceId = requiredUuid(body.senderDeviceId, "senderDeviceId");
+
+      // Get the transfer record
+      const transferResult = await db.query(
+        `SELECT * FROM media_transfers WHERE transfer_id = $1`,
+        [transferId]
+      );
+
+      if (!transferResult.rows[0]) {
+        return reply.code(404).send({ error: "Media transfer not found" });
+      }
+
+      const transfer = transferResult.rows[0];
+
+      // Validate sender matches
+      if (transfer.sender_device_id !== deviceId) {
+        return reply.code(403).send({ error: "Unauthorized to upload to this transfer" });
+      }
+
+      // Validate transfer is in correct state
+      if (transfer.status !== 'PENDING' && transfer.status !== 'UPLOADING') {
+        return reply.code(400).send({ error: "Transfer is not in uploadable state" });
+      }
+
+      // In a real implementation, we would handle the file upload here
+      // For now, we'll simulate by updating progress
+      // The actual implementation would stream the upload to object storage
+
+      // For this implementation, we'll assume the client sends the entire file in one request
+      // but in reality, this should handle chunked uploads
+      const body = request.body as Record<string, unknown>;
+      const chunkData = base64(body.data, ""); // This would be the chunk data
+      const chunkIndex = Number(body.chunkIndex);
+      const totalChunks = Number(body.totalChunks);
+
+      // Update progress
+      const newProgress = Math.min(100, Math.floor(((chunkIndex + 1) / totalChunks) * 100));
+      const newStatus = newProgress >= 100 ? 'COMPLETED' : 'UPLOADING';
+
+      await db.query(
+        `UPDATE media_transfers SET
+         upload_progress = $1,
+         status = $2,
+         checksum = $3
+         WHERE transfer_id = $4`,
+        [newProgress, newStatus, body.checksum || null, transferId]
+      );
+
+      // If transfer is complete, we would notify the recipient via WebSocket
+      // In a full implementation, we'd create a message record and send a WebSocket event
+      if (newStatus === 'COMPLETED') {
+        // Create a placeholder message record - in reality, this would contain encrypted metadata
+        const messageId = randomUUID();
+        await db.query(
+          `INSERT INTO media_transfers(message_id) VALUES ($1) WHERE transfer_id = $2`,
+          [messageId, transferId]
+        );
+
+        // Notify recipient via WebSocket
+        hub.send(transfer.receiver_device_id, {
+          type: "media.transfer.completed",
+          transferId,
+          messageId,
+          senderDeviceId: transfer.sender_device_id,
+          filename: transfer.filename,
+          mimeType: transfer.mimeType,
+          fileSize: transfer.file_size
+        });
+
+        app.log.info({ event: "MEDIA_TRANSFER_COMPLETED", transferId, messageId });
+      }
+
+      return reply.code(200).send({
+        success: true,
+        uploadProgress: newProgress,
+        status: newStatus
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid upload request" });
+    }
+  });
+
+  app.get("/media/:transferId/download", async (request: ApiRequest, reply) => {
+    try {
+      const transferId = requiredUuid(request.params.transferId, "transferId");
+      const deviceId = requiredUuid(body.receiverDeviceId, "receiverDeviceId");
+
+      // Get the transfer record
+      const transferResult = await db.query(
+        `SELECT * FROM media_transfers WHERE transfer_id = $1`,
+        [transferId]
+      );
+
+      if (!transferResult.rows[0]) {
+        return reply.code(404).send({ error: "Media transfer not found" });
+      }
+
+      const transfer = transferResult.rows[0];
+
+      // Validate receiver matches
+      if (transfer.receiver_device_id !== deviceId) {
+        return reply.code(403).send({ error: "Unauthorized to download from this transfer" });
+      }
+
+      // Validate transfer is completed
+      if (transfer.status !== 'COMPLETED') {
+        return reply.code(400).send({ error: "Transfer is not yet complete" });
+      }
+
+      // Validate not expired
+      const expiresAt = new Date(transfer.expires_at);
+      if (expiresAt < new Date()) {
+        return reply.code(410).send({ error: "Media transfer has expired" });
+      }
+
+      // In a real implementation with Supabase Storage, we would generate a download URL here
+      // For now, we'll return the metadata needed to construct the download
+      const downloadUrl = `/media/storage/${transfer.bucket}/${transfer.objectKey}`;
+
+      app.log.info({ event: "MEDIA_TRANSFER_DOWNLOAD_AUTHORIZED", transferId, deviceId });
+      return reply.code(200).send({
+        downloadUrl,
+        expiresAt: transfer.expires_at,
+        filename: transfer.filename,
+        mimeType: transfer.mimeType,
+        fileSize: transfer.file_size,
+        checksum: transfer.checksum
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid download request" });
+    }
+  });
+
+  app.get("/media/:transferId", async (request: ApiRequest, reply) => {
+    try {
+      const transferId = requiredUuid(request.params.transferId, "transferId");
+      const deviceId = requiredUuid(body.senderDeviceId, "senderDeviceId");
+
+      // Get the transfer record
+      const transferResult = await db.query(
+        `SELECT * FROM media_transfers WHERE transfer_id = $1`,
+        [transferId]
+      );
+
+      if (!transferResult.rows[0]) {
+        return reply.code(404).send({ error: "Media transfer not found" });
+      }
+
+      const transfer = transferResult.rows[0];
+
+      // Validate sender matches (for status checks) or receiver (for download prep)
+      if (transfer.sender_device_id !== deviceId && transfer.receiver_device_id !== deviceId) {
+        return reply.code(403).send({ error: "Unauthorized to access this transfer" });
+      }
+
+      app.log.info({ event: "MEDIA_TRANSFER_STATUS_QUERIED", transferId, deviceId });
+      return reply.code(200).send({
+        transferId,
+        status: transfer.status,
+        uploadProgress: transfer.upload_progress,
+        filename: transfer.filename,
+        mimeType: transfer.mimeType,
+        fileSize: transfer.file_size,
+        objectKey: transfer.object_key,
+        bucket: transfer.bucket,
+        checksum: transfer.checksum,
+        createdAt: transfer.created_at,
+        expiresAt: transfer.expires_at
+      });
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid status request" });
+    }
+  });
+
   const expiryTimer = setInterval(async () => {
     try {
       const expired = await db.query(

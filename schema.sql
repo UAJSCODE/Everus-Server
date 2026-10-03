@@ -45,3 +45,24 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_recipient_delivery_idx
     ON messages(to_device, delivered_at, created_at);
+
+CREATE TABLE IF NOT EXISTS media_transfers (
+    transfer_id UUID PRIMARY KEY,
+    message_id UUID NOT NULL REFERENCES messages(message_id),
+    sender_device_id UUID NOT NULL REFERENCES devices(device_id),
+    receiver_device_id UUID NOT NULL REFERENCES devices(device_id),
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    file_size BIGINT NOT NULL,
+    object_key TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'UPLOADING', 'COMPLETED', 'FAILED', 'EXPIRED')),
+    upload_progress INTEGER DEFAULT 0 CHECK (upload_progress >= 0 AND upload_progress <= 100),
+    checksum TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS media_transfers_receiver_idx
+    ON media_transfers(receiver_device_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS media_transfers_message_idx
+    ON media_transfers(message_id);
