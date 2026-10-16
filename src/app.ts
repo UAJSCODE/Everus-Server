@@ -388,6 +388,76 @@ export async function createApp({ db, pairingTtlSeconds = Number(process.env.PAI
     }
   });
 
+  // DELETE MESSAGE ENDPOINT
+  app.delete("/messages/:messageId", async (request: ApiRequest, reply) => {
+    try {
+      const messageId = requiredUuid(request.params.messageId, "messageId");
+      const deviceId = requiredUuid(request.query.deviceId, "deviceId");
+      const timestamp = Number(request.query.timestamp);
+      const nonce = requiredString(request.query.nonce, "nonce", 128);
+      const signature = base64(request.query.signature, 128);
+
+      // Validate timestamp and nonce
+      checkTimestampAndNonce(deviceId, timestamp, nonce);
+
+      // Get the device
+      const device = (await db.query(
+        "SELECT device_id, ed25519_public_key, x25519_public_key FROM devices WHERE device_id = $1",
+        [deviceId],
+      )).rows[0];
+
+      if (!device) {
+        return reply.code(404).send({ error: "Device not found" });
+      }
+
+      // Get the message to verify it exists and get relationship info
+      const messageResult = await db.query(
+        `SELECT m.*, r.device_a, r.device_b
+         FROM messages m
+         JOIN relationships r ON m.relationship_id = r.relationship_id
+         WHERE m.message_id = $1`,
+        [messageId]
+      );
+
+      if (!messageResult.rows[0]) {
+        return reply.code(404).send({ error: "Message not found" });
+      }
+
+      const message = messageResult.rows[0];
+
+      // Verify the device is part of this relationship
+      const isInRelationship =
+        message.device_a === deviceId ||
+        message.device_b === deviceId;
+
+      if (!isInRelationship) {
+        return reply.code(403).send({ error: "Not authorized to delete this message" });
+      }
+
+      // Delete the message
+      await db.query(
+        "DELETE FROM messages WHERE message_id = $1",
+        [messageId]
+      );
+
+      // Notify both devices about the deletion via WebSocket
+      const deletionEvent = {
+        type: "message.deleted",
+        messageId: messageId
+      };
+
+      // Send to both devices in the relationship
+      hub.send(message.device_a, deletionEvent);
+      hub.send(message.device_b, deletionEvent);
+
+      app.log.info({ event: "MESSAGE_DELETED", messageId, deviceId });
+
+      return { messageId, deleted: true };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : "Invalid delete message request" });
+    }
+  });
+
   // MEDIA TRANSFER ENDPOINTS
   app.post("/media/init", async (request: ApiRequest, reply) => {
     try {
